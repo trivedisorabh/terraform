@@ -7,12 +7,13 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/hashicorp/terraform/configs"
+
 	"github.com/hashicorp/terraform/tfdiags"
 
 	"github.com/hashicorp/go-getter"
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/config"
-	"github.com/hashicorp/terraform/config/module"
 	"github.com/hashicorp/terraform/terraform"
 )
 
@@ -118,37 +119,32 @@ func (c *ApplyCommand) Run(args []string) int {
 
 	var diags tfdiags.Diagnostics
 
-	// Load the module if we don't have one yet (not running from plan)
-	var mod *module.Tree
+	var backendConfig *configs.Backend
 	if plan == nil {
-		var modDiags tfdiags.Diagnostics
-		mod, modDiags = c.Module(configPath)
-		diags = diags.Append(modDiags)
-		if modDiags.HasErrors() {
+		var configDiags tfdiags.Diagnostics
+		backendConfig, configDiags = c.loadBackendConfig(configPath)
+		diags = diags.Append(configDiags)
+		if configDiags.HasErrors() {
 			c.showDiagnostics(diags)
 			return 1
 		}
 	}
 
-	var conf *config.Config
-	if mod != nil {
-		conf = mod.Config()
-	}
-
 	// Load the backend
-	b, err := c.Backend(&BackendOpts{
-		Config: conf,
+	b, beDiags := c.Backend(&BackendOpts{
+		Config: backendConfig,
 		Plan:   plan,
 	})
-	if err != nil {
-		c.Ui.Error(fmt.Sprintf("Failed to load backend: %s", err))
+	diags = diags.Append(beDiags)
+	if beDiags.HasErrors() {
+		c.showDiagnostics(diags)
 		return 1
 	}
 
 	// Build the operation
 	opReq := c.Operation()
 	opReq.Destroy = c.Destroy
-	opReq.Module = mod
+	opReq.ConfigDir = configPath
 	opReq.Plan = plan
 	opReq.PlanRefresh = refresh
 	opReq.Type = backend.OperationTypeApply
@@ -166,15 +162,18 @@ func (c *ApplyCommand) Run(args []string) int {
 	}
 
 	if !c.Destroy {
-		// Get the right module that we used. If we ran a plan, then use
-		// that module.
-		if plan != nil {
-			mod = plan.Module
-		}
+		// TODO: Print outputs, once this is updated to use new config types.
+		/*
+			// Get the right module that we used. If we ran a plan, then use
+			// that module.
+			if plan != nil {
+				mod = plan.Module
+			}
 
-		if outputs := outputsAsString(op.State, terraform.RootModulePath, mod.Config().Outputs, true); outputs != "" {
-			c.Ui.Output(c.Colorize().Color(outputs))
-		}
+			if outputs := outputsAsString(op.State, terraform.RootModulePath, mod.Config().Outputs, true); outputs != "" {
+				c.Ui.Output(c.Colorize().Color(outputs))
+			}
+		*/
 	}
 
 	return 0

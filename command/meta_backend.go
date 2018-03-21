@@ -7,13 +7,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"path/filepath"
 	"strings"
 
-	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/hcl"
+	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/hcl2/hcldec"
+
+	"github.com/hashicorp/terraform/tfdiags"
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/command/clistate"
 	"github.com/hashicorp/terraform/config"
@@ -39,7 +42,7 @@ type BackendOpts struct {
 
 	// ConfigExtra is extra configuration to merge into the backend
 	// configuration after the extra file above.
-	ConfigExtra map[string]interface{}
+	ConfigExtra map[string]cty.Value
 
 	// Plan is a plan that is being used. If this is set, the backend
 	// configuration and output configuration will come from this plan.
@@ -69,7 +72,9 @@ type BackendOpts struct {
 // and is unsafe to create multiple backends used at once. This function
 // can be called multiple times with each backend being "live" (usable)
 // one at a time.
-func (m *Meta) Backend(opts *BackendOpts) (backend.Enhanced, error) {
+func (m *Meta) Backend(opts *BackendOpts) (backend.Enhanced, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
 	// If no opts are set, then initialize
 	if opts == nil {
 		opts = &BackendOpts{}
@@ -85,11 +90,17 @@ func (m *Meta) Backend(opts *BackendOpts) (backend.Enhanced, error) {
 		// the backend comes from the configuration.
 		if opts.Plan != nil {
 			b, err = m.backendFromPlan(opts)
+			if err != nil {
+				diags = diags.Append(err)
+			}
 		} else {
-			b, err = m.backendFromConfig(opts)
+			var backendDiags tfdiags.Diagnostics
+			b, backendDiags = m.backendFromConfig(opts)
+			diags = diags.Append(backendDiags)
 		}
-		if err != nil {
-			return nil, err
+
+		if diags.HasErrors() {
+			return nil, diags
 		}
 
 		log.Printf("[INFO] command: backend initialized: %T", b)
@@ -99,6 +110,7 @@ func (m *Meta) Backend(opts *BackendOpts) (backend.Enhanced, error) {
 	cliOpts := &backend.CLIOpts{
 		CLI:                 m.Ui,
 		CLIColor:            m.Colorize(),
+		ShowDiagnostics:     m.showDiagnostics,
 		StatePath:           m.statePath,
 		StateOutPath:        m.stateOutPath,
 		StateBackupPath:     m.backupPath,
@@ -115,10 +127,12 @@ func (m *Meta) Backend(opts *BackendOpts) (backend.Enhanced, error) {
 	// If the backend supports CLI initialization, do it.
 	if cli, ok := b.(backend.CLI); ok {
 		if err := cli.CLIInit(cliOpts); err != nil {
-			return nil, fmt.Errorf(
+			diags = diags.Append(fmt.Errorf(
 				"Error initializing backend %T: %s\n\n"+
-					"This is a bug, please report it to the backend developer",
-				b, err)
+					"This is a bug; please report it to the backend developer",
+				b, err,
+			))
+			return nil, diags
 		}
 	}
 
@@ -178,10 +192,12 @@ func (m *Meta) Operation() *backend.Operation {
 }
 
 // backendConfig returns the local configuration for the backend
-func (m *Meta) backendConfig(opts *BackendOpts) (*config.Backend, error) {
+func (m *Meta) backendConfig(opts *BackendOpts) (*configs.Backend, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
+
 	if opts.Config == nil {
 		// check if the config was missing, or just not required
-		conf, err := m.Config(".")
+		conf, err := m.loadBackendConfig(".")
 		if err != nil {
 			return nil, err
 		}
@@ -197,81 +213,37 @@ func (m *Meta) backendConfig(opts *BackendOpts) (*config.Backend, error) {
 
 	c := opts.Config
 
-	// If there is no Terraform configuration block, no backend config
-	if c.Terraform == nil {
-		log.Println("[INFO] command: empty terraform config, returning nil")
+	if c == nil {
+		log.Println("[INFO] command: no explicit backend config")
 		return nil, nil
 	}
 
-	// Get the configuration for the backend itself.
-	backend := c.Terraform.Backend
-	if backend == nil {
-		log.Println("[INFO] command: empty backend config, returning nil")
-		return nil, nil
-	}
+	configBody := c.Config
 
 	// If we have a config file set, load that and merge.
 	if opts.ConfigFile != "" {
-		log.Printf(
-			"[DEBUG] command: loading extra backend config from: %s",
-			opts.ConfigFile)
-		rc, err := m.backendConfigFile(opts.ConfigFile)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"Error loading extra configuration file for backend: %s", err)
+		log.Printf("[DEBUG] command: loading extra backend config from: %s", opts.ConfigFile)
+		fileBody, fileDiags := m.loadHCLFile(opts.ConfigFile)
+		diags = diags.Append(fileDiags)
+		if fileDiags.HasErrors() {
+			return nil, diags
 		}
 
-		// Merge in the configuration
-		backend.RawConfig = backend.RawConfig.Merge(rc)
+		configBody = configs.MergeBodies(configBody, fileBody)
 	}
 
 	// If we have extra config values, merge that
 	if len(opts.ConfigExtra) > 0 {
-		log.Printf(
-			"[DEBUG] command: adding extra backend config from CLI")
-		rc, err := config.NewRawConfig(opts.ConfigExtra)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"Error adding extra configuration file for backend: %s", err)
-		}
-
-		// Merge in the configuration
-		backend.RawConfig = backend.RawConfig.Merge(rc)
+		log.Printf("[DEBUG] command: adding extra backend config from CLI")
+		synthBody := configs.SynthBody("-backend-config=...", opts.ConfigExtra)
+		configBody = configs.MergeBodies(configBody, synthBody)
 	}
 
-	// Validate the backend early. We have to do this before the normal
-	// config validation pass since backend loading happens earlier.
-	if errs := backend.Validate(); len(errs) > 0 {
-		return nil, multierror.Append(nil, errs...)
-	}
-
-	// Return the configuration which may or may not be set
-	return backend, nil
-}
-
-// backendConfigFile loads the extra configuration to merge with the
-// backend configuration from an extra file if specified by
-// BackendOpts.ConfigFile.
-func (m *Meta) backendConfigFile(path string) (*config.RawConfig, error) {
-	// Read the file
-	d, err := ioutil.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse it
-	hclRoot, err := hcl.Parse(string(d))
-	if err != nil {
-		return nil, err
-	}
-
-	// Decode it
-	var c map[string]interface{}
-	if err := hcl.DecodeObject(&c, hclRoot); err != nil {
-		return nil, err
-	}
-
-	return config.NewRawConfig(c)
+	// We'll shallow-copy configs.Backend here so that we can replace the
+	// body without affecting others that hold this reference.
+	configCopy := *c
+	c.Config = configBody
+	return &configCopy, diags
 }
 
 // backendFromConfig returns the initialized (not configured) backend
@@ -283,21 +255,11 @@ func (m *Meta) backendConfigFile(path string) (*config.RawConfig, error) {
 //
 // This function may query the user for input unless input is disabled, in
 // which case this function will error.
-func (m *Meta) backendFromConfig(opts *BackendOpts) (backend.Backend, error) {
+func (m *Meta) backendFromConfig(opts *BackendOpts) (backend.Backend, tfdiags.Diagnostics) {
 	// Get the local backend configuration.
-	c, err := m.backendConfig(opts)
-	if err != nil {
-		return nil, fmt.Errorf("Error loading backend config: %s", err)
-	}
-
-	// cHash defaults to zero unless c is set
-	var cHash uint64
-	if c != nil {
-		// We need to rehash to get the value since we may have merged the
-		// config with an extra ConfigFile. We don't do this when merging
-		// because we do want the ORIGINAL value on c so that we store
-		// that to not detect drift. This is covered in tests.
-		cHash = c.Rehash()
+	c, diags := m.backendConfig(opts)
+	if diags.HasErrors() {
+		return nil, diags
 	}
 
 	// Get the path to where we store a local cache of backend configuration
@@ -306,7 +268,8 @@ func (m *Meta) backendFromConfig(opts *BackendOpts) (backend.Backend, error) {
 	statePath := filepath.Join(m.DataDir(), DefaultStateFilename)
 	sMgr := &state.LocalState{Path: statePath}
 	if err := sMgr.RefreshState(); err != nil {
-		return nil, fmt.Errorf("Error loading state: %s", err)
+		diags = diags.Append(fmt.Errorf("Failed to load state: %s", err))
+		return nil, diags
 	}
 
 	// Load the state, it must be non-nil for the tests below but can be empty
@@ -347,7 +310,8 @@ func (m *Meta) backendFromConfig(opts *BackendOpts) (backend.Backend, error) {
 				"Unsetting the previously set backend %q",
 				s.Backend.Type)
 			m.backendInitRequired(initReason)
-			return nil, errBackendInitRequired
+			diags = diags.Append(errBackendInitRequired)
+			return nil, diags
 		}
 
 		return m.backend_c_r_S(c, sMgr, true)
@@ -1204,50 +1168,44 @@ func (m *Meta) backend_C_R_S_unchanged(
 // Reusable helper functions for backend management
 //-------------------------------------------------------------------
 
-func (m *Meta) backendInitFromConfig(c *config.Backend) (backend.Backend, error) {
-	// Create the config.
-	config := terraform.NewResourceConfig(c.RawConfig)
+func (m *Meta) backendInitFromConfig(c *configs.Backend) (backend.Backend, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
 
 	// Get the backend
 	f := backendinit.Backend(c.Type)
 	if f == nil {
-		return nil, fmt.Errorf(strings.TrimSpace(errBackendNewUnknown), c.Type)
+		diags = diags.Append(fmt.Errorf(strings.TrimSpace(errBackendNewUnknown), c.Type))
+		return nil, diags
 	}
 	b := f()
 
+	schema := b.ConfigSchema()
+	decSpec := schema.DecoderSpec()
+	configVal, hclDiags := hcldec.Decode(c.Config, decSpec, nil)
+	diags = diags.Append(hclDiags)
+	if hclDiags.HasErrors() {
+		return nil, diags
+	}
+
 	// TODO: test
-	// Ask for input if we have input enabled
 	if m.Input() {
 		var err error
-		config, err = b.Input(m.UIInput(), config)
+		configVal, err = m.inputForSchema(configVal, schema)
 		if err != nil {
-			return nil, fmt.Errorf(
-				"Error asking for input to configure the backend %q: %s",
-				c.Type, err)
+			diags = diags.Append(fmt.Errorf("Error asking for input to configure backend %q: %s", c.Type, err))
 		}
 	}
 
-	// Validate
-	warns, errs := b.Validate(config)
-	for _, warning := range warns {
-		// We just write warnings directly to the UI. This isn't great
-		// since we're a bit deep here to be pushing stuff out into the
-		// UI, but sufficient to let us print out deprecation warnings
-		// and the like.
-		m.Ui.Warn(warning)
-	}
-	if len(errs) > 0 {
-		return nil, fmt.Errorf(
-			"Error configuring the backend %q: %s",
-			c.Type, multierror.Append(nil, errs...))
+	validateDiags := b.ValidateConfig(configVal)
+	diags = diags.Append(validateDiags.InConfigBody(c.Config))
+	if validateDiags.HasErrors() {
+		return nil, diags
 	}
 
-	// Configure
-	if err := b.Configure(config); err != nil {
-		return nil, fmt.Errorf(errBackendNewConfig, c.Type, err)
-	}
+	configureDiags := b.Configure(configVal)
+	diags = diags.Append(configureDiags.InConfigBody(c.Config))
 
-	return b, nil
+	return b, diags
 }
 
 func (m *Meta) backendInitFromLegacy(s *terraform.RemoteState) (backend.Backend, error) {
@@ -1280,29 +1238,35 @@ func (m *Meta) backendInitFromLegacy(s *terraform.RemoteState) (backend.Backend,
 	return b, nil
 }
 
-func (m *Meta) backendInitFromSaved(s *terraform.BackendState) (backend.Backend, error) {
-	// Create the config. We do this from the backend state since this
-	// has the complete configuration data whereas the config itself
-	// may require input.
-	rawC, err := config.NewRawConfig(s.Config)
-	if err != nil {
-		return nil, fmt.Errorf("Error configuring backend: %s", err)
-	}
-	config := terraform.NewResourceConfig(rawC)
+func (m *Meta) backendInitFromSaved(s *terraform.BackendState) (backend.Backend, tfdiags.Diagnostics) {
+	var diags tfdiags.Diagnostics
 
 	// Get the backend
 	f := backendinit.Backend(s.Type)
 	if f == nil {
-		return nil, fmt.Errorf(strings.TrimSpace(errBackendSavedUnknown), s.Type)
+		diags = diags.Append(fmt.Errorf(strings.TrimSpace(errBackendSavedUnknown), s.Type))
+		return nil, diags
 	}
 	b := f()
 
-	// Configure
-	if err := b.Configure(config); err != nil {
-		return nil, fmt.Errorf(errBackendSavedConfig, s.Type, err)
+	schema := b.ConfigSchema()
+	configVal, err := s.Config(schema)
+
+	if err != nil {
+		diags = diags.Append(errwrap.Wrapf("saved backend configuration is invalid: {{err}}", err))
+		return nil, diags
 	}
 
-	return b, nil
+	validateDiags := b.ValidateConfig(configVal)
+	diags = diags.Append(validateDiags.InConfigBody(c.Config))
+	if validateDiags.HasErrors() {
+		return nil, diags
+	}
+
+	configureDiags := b.Configure(configVal)
+	diags = diags.Append(configureDiags.InConfigBody(c.Config))
+
+	return b, diags
 }
 
 func (m *Meta) backendInitRequired(reason string) {
